@@ -43,8 +43,9 @@
 const childprocess = require('child_process');
 const events = require('events');
 const PromiseQueue = require('promise-queue');
+const ps = require('ps-node');
 const regExp = {
-  terminalMessage: /now\sready|already\sin\suse|not\slisten|error|denied|can't/im,
+  terminalMessage: /now\sready|daemon\sstarted|already\sin\suse|not\slisten|error|denied|can't/im,
   errorMessage: /#\s+(.*error|can't.*)/im,
   singleWhiteSpace: /\s/g,
   multipleWhiteSpace: /\s\s+/g
@@ -97,6 +98,10 @@ class RedisServer extends events.EventEmitter {
       target.port = source.port;
     }
 
+    if (source.daemonize != null) {
+      target.daemonize = source.daemonize;
+    }
+
     return target;
   }
 
@@ -119,6 +124,10 @@ class RedisServer extends events.EventEmitter {
 
     if (config.slaveof != null) {
       flags.push(`--slaveof ${config.slaveof}`);
+    }
+
+    if (config.daemonize != null) {
+      flags.push(`--daemonize ${config.daemonize}`);
     }
 
     return flags;
@@ -149,6 +158,9 @@ class RedisServer extends events.EventEmitter {
       case 'nowready':
         break;
 
+      case 'daemonstarted':
+        break;
+      
       case 'alreadyinuse':
         result.err = new Error('Address already in use');
         result.err.code = -1;
@@ -181,6 +193,41 @@ class RedisServer extends events.EventEmitter {
     }
 
     return result;
+  }
+
+  /**
+   * Find a forked Redis process and kill it using the pid.
+   * @protected
+   * @argument {String} command
+   * @argument {String} processArguments
+   */
+  static killForkedProcess(command, processArguments) {
+    return new Promise((resolve, reject) => {
+      ps.lookup({
+        command: command,
+        arguments: processArguments,
+      }, function(err, resultList) {
+        if (err) {
+          throw new Error( err );
+        }
+        if (resultList.length > 0) {
+          resultList.forEach(function(process){
+            if( process ){
+              ps.kill(process.pid, function(err) {
+                if (err) {
+                  throw new Error(err);
+                }
+                else {
+                  resolve();
+                }
+              });
+            }
+          });
+        } else {
+          resolve();
+        }
+      });
+    });
   }
 
   /**
@@ -256,7 +303,9 @@ class RedisServer extends events.EventEmitter {
           server.config.bin,
           RedisServer.parseFlags(server.config)
         );
-
+        if(server.config.daemonize === 'yes') {
+          dataListener('daemon started');
+        }
         server.process.stdout.on('data', dataListener);
         server.process.on('close', () => {
           server.process = null;
@@ -287,23 +336,26 @@ class RedisServer extends events.EventEmitter {
     if (server.isClosing) {
       return server.closePromise;
     }
+    RedisServer.killForkedProcess('redis-server', '')
+      .then(function() {
+        server.isClosing = true;
+        server.isOpening = false;
+        server.closePromise = server.promiseQueue.add(() => {
+          if (server.isOpening || !server.isRunning) {
+            server.isClosing = false;
 
-    server.isClosing = true;
-    server.isOpening = false;
-    server.closePromise = server.promiseQueue.add(() => {
-      if (server.isOpening || !server.isRunning) {
-        server.isClosing = false;
+            return Promise.resolve(null);
+          }
 
-        return Promise.resolve(null);
-      }
-
-      return new Promise((resolve) => {
-        server.emit('closing');
-        server.process.once('close', () => resolve(null));
-        server.process.kill();
+          return new Promise((resolve) => {
+            server.emit('closing');
+            server.process.once('close', () => resolve(null));
+            server.process.kill();
+          });
+        });
+      })
+      .catch(function(){
       });
-    });
-
     return server.closePromise;
   }
 
